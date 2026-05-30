@@ -6,7 +6,7 @@ use winit::window::Window;
 use vulkanalia::loader::{LIBRARY, LibloadingLoader};
 use vulkanalia::prelude::v1_0::*;
 use vulkanalia::window as vk_window;
-use vulkanalia::vk::{KhrSurfaceExtensionInstanceCommands, KhrSwapchainExtensionDeviceCommands, Queue};
+use vulkanalia::vk::{KhrSurfaceExtensionInstanceCommands, KhrSwapchainExtensionDeviceCommands};
 
 use crate::SuitabilityError;
 use crate::consts::{DEVICE_EXTENSIONS, PORTABILITY_MACOS_VERSION, VALIDATION_ENABLED, VALIDATION_LAYER};
@@ -39,6 +39,7 @@ impl App {
         let device = create_logical_device(&entry, &instance, &mut data)?;
 
         create_swapchain(&window, &instance, &device, &mut data)?;
+        create_swapchain_image_views(&device, &mut data)?;
 
         Ok( Self { entry, instance, data, device })
     }
@@ -50,6 +51,9 @@ impl App {
 
     /// Destroys our Vulkan app.
     pub unsafe fn destroy(&mut self) {
+        self.data.swapchain_image_views
+            .iter()
+            .for_each(|i| self.device.destroy_image_view(*i, None));
         self.device.destroy_swapchain_khr(self.data.swapchain, None);
         self.device.destroy_device(None);
         // window handle
@@ -74,6 +78,8 @@ pub struct AppData {
     swapchain_images : Vec<vk::Image>,
     swapchain_format : vk::Format,
     swapchain_extent : vk::Extent2D,
+    /// views om images in te renderen
+    swapchain_image_views : Vec<vk::ImageView>,
 }
 
 /*
@@ -114,7 +120,6 @@ impl QueueFamilyIndices {
     }
 }
 
-
 #[derive(Clone, Debug)]
 struct SwapchainSupport {
     capabilities : vk::SurfaceCapabilitiesKHR,
@@ -137,11 +142,7 @@ impl SwapchainSupport {
             formats,
             present_modes
         })
-
     }
-
-
-
 }
 
 
@@ -442,5 +443,42 @@ fn get_swapchain_extent(
             ))
             .build()
     }
+}
+
+unsafe fn create_swapchain_image_views(
+    device : &Device,
+    data: &mut AppData,
+) -> Result<()> {
+     let x = data
+        .swapchain_images
+        .iter()
+        .map(|i| {
+
+            let components = vk::ComponentMapping::builder()
+                .r(vk::ComponentSwizzle::IDENTITY)
+                .g(vk::ComponentSwizzle::IDENTITY)
+                .b(vk::ComponentSwizzle::IDENTITY)
+                .a(vk::ComponentSwizzle::IDENTITY);
+
+            // layer count enzo op 1, verhogen als ge stereoscopic 3D wilt gaan
+            let subresource_range = vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            let info = vk::ImageViewCreateInfo::builder()
+                .image(*i)
+                .subresource_range(subresource_range)
+                .view_type(vk::ImageViewType::_2D)
+                .components(components)
+                .format(data.swapchain_format);
+
+            device.create_image_view(&info, None)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(())
 }
 
