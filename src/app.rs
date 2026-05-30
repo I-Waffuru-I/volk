@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use log::*;
+use vulkanalia::bytecode::Bytecode;
 use winit::window::Window;
 use vulkanalia::loader::{LIBRARY, LibloadingLoader};
 use vulkanalia::prelude::v1_0::*;
@@ -41,6 +42,8 @@ impl App {
         create_swapchain(&window, &instance, &device, &mut data)?;
         create_swapchain_image_views(&device, &mut data)?;
 
+        create_pipeline(&device, &mut data)?;
+
         Ok( Self { entry, instance, data, device })
     }
 
@@ -51,6 +54,7 @@ impl App {
 
     /// Destroys our Vulkan app.
     pub unsafe fn destroy(&mut self) {
+        self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
         self.data.swapchain_image_views
             .iter()
             .for_each(|i| self.device.destroy_image_view(*i, None));
@@ -80,6 +84,7 @@ pub struct AppData {
     swapchain_extent : vk::Extent2D,
     /// views om images in te renderen
     swapchain_image_views : Vec<vk::ImageView>,
+    pipeline_layout : vk::PipelineLayout,
 }
 
 /*
@@ -154,6 +159,158 @@ impl SwapchainSupport {
  *
  * ------
  */
+
+
+
+unsafe fn create_pipeline(
+    device : &Device,
+    data : &mut AppData,
+    ) -> Result<()> {
+    let vert = include_bytes!("../shaders/vert.spv");
+    let frag = include_bytes!("../shaders/frag.spv");
+
+    let vert_module = create_shader_module(device, vert)?;
+    let frag_module = create_shader_module(device, frag)?;
+
+    let vert_stage = vk::PipelineShaderStageCreateInfo::builder()
+        // welke stage in de pipeline het wordt gebruikt
+        .stage(vk::ShaderStageFlags::VERTEX)
+        // gebruikt om constants te definieren
+        // .specialization_info(specialization_info)
+        .module(vert_module)
+        // name van de entry point in shader code. Moet niet persé main zijn
+        // zo kunt ge dubbele behaviour fixen met 1 enkele shader module bvb
+        .name(b"main\0");
+    let frag_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::FRAGMENT)
+        .module(frag_module)
+        .name(b"main\0");
+
+    // default for now want we laden geen vertex data in 
+    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
+        // spacing tussen data, en of het per-vertex of per-instance is 
+        // .vertex_binding_descriptions(vertex_binding_descriptions);
+        // type attributes gegeven aan de vert shader, welke bindings en welke offset
+        // .vertex_attribute_descriptions(vertex_attribute_descriptions)
+       
+
+    let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        // wat voor geometry getekend wordt 
+        // POINT_LIST: points from vertices 
+        // LINE_LIST: line voor elke 2 vertices, zonder reuse 
+        // LINE_STRIP: einde van elke vertex is start voor volgende 
+        // TRIANGLE_LIST: triangle van elke 3 vertices, zonder reuse
+        // TRIANGLE_STRIP: 2nd en 3e vertex van elke triangle zijn de eerste 2 voor dee volgende
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        // allowed om in _STRIP modes een 0xFFFF index te zetten om clean reset te doen
+        .primitive_restart_enable(false);
+
+    // welke regio van de framebuffer de output te renderen.
+    // Bena altijd  (0, 0) -> (width, height)
+    let viewport = vk::Viewport::builder()
+        .x(0.0)
+        .y(0.0)
+        .width(data.swapchain_extent.width as f32)
+        .height(data.swapchain_extent.height as f32)
+        .min_depth(0.0)
+        .max_depth(1.0);
+    // scissors zijn een... filter voor waar op de viewport pixels zetten?
+    // idk, gwn default volledige framebuffer pakken ig
+    let scissor = vk::Rect2D::builder()
+        .offset(vk::Offset2D {x:0, y:0})
+        .extent(data.swapchain_extent);
+    let viewports = &[viewport];
+    let scissors = &[scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        .viewports(viewports)
+        .scissors(scissors);
+
+
+    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+        // als true, frags buiten de 'far plane' worden geclamped en niet discarded.
+        // handig voor shadow maps. Heeft GPU feature nodig
+        .depth_clamp_enable(false)
+        // basically turned heel dit off
+        // geen geometry passed door de rasterizer en naar framebuffer
+        .rasterizer_discard_enable(false)
+        // FILL: vul de area van een polygon met frags
+        // LINE: teken edges enkel
+        // POINT: teken vertices as punten
+        .polygon_mode(vk::PolygonMode::FILL)
+        // duh, param is width in pixels 
+        .line_width(1.0)
+        // cull backside frags
+        .cull_mode(vk::CullModeFlags::BACK)
+        // welke orientation gebruiken om de front face te vinden
+        .front_face(vk::FrontFace::CLOCKWISE)
+        // alter depth door een value te adden. Kan gebruikt worden in shadow mapping
+        .depth_bias_enable(false);
+
+    // een manier om anti-aliasing te doen. GPU feature nodig
+    // disable for now
+    let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::_1);
+
+
+    // colour blending is het samenvoegen van frag kleur met de kleur die er al was
+    // dit mixed old en new colour om een final te berekenen
+    let attachment = vk::PipelineColorBlendAttachmentState::builder()
+        .color_write_mask(vk::ColorComponentFlags::all())
+        // skipped all this, gebruikt new frag colour as final colour
+        .blend_enable(false)
+        .src_color_blend_factor(vk::BlendFactor::ONE)  
+        .dst_color_blend_factor(vk::BlendFactor::ZERO) 
+        .color_blend_op(vk::BlendOp::ADD)              
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)  
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO) 
+        .alpha_blend_op(vk::BlendOp::ADD);             
+    /*
+     let attachment = vk::PipelineColorBlendAttachmentState::builder()
+        .color_write_mask(vk::ColorComponentFlags::all())
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .alpha_blend_op(vk::BlendOp::ADD);
+     */
+    let attachments = &[attachment];
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+        // op TRUE zetten als ge colour blend met bitwise operations wil doen
+        // zet blend_enable automatisch op false
+        .logic_op_enable(false)
+        .logic_op(vk::LogicOp::COPY)
+        .blend_constants([0.0, 0.0, 0.0, 0.0])
+        .attachments(attachments);
+
+
+    let layout_info = vk::PipelineLayoutCreateInfo::builder();
+
+    data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
+
+    // modules zijn gwn simpele wrappper rond bytecode.
+    // compilation & linking gebeurt pas eens de pipeline er is, dus dit is safe te deleten
+    device.destroy_shader_module(vert_module, None);
+    device.destroy_shader_module(frag_module, None);
+
+    Ok(())
+}
+
+unsafe fn create_shader_module(
+    device : &Device,
+    bytecode : &[u8],
+    ) -> Result<vk::ShaderModule> {
+    let bytec = Bytecode::new(bytecode)?;
+    let info = vk::ShaderModuleCreateInfo::builder()
+        .code(bytec.code())
+        .code_size(bytec.code_size());
+    Ok(device.create_shader_module(&info, None)?)
+}
+
+
+
 
 
 unsafe fn create_instance(window: &Window, entry: &Entry) -> Result<Instance> {
