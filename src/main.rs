@@ -9,7 +9,6 @@
     clippy::unnecessary_wraps
 )]
 
-use std::collections::HashSet;
 
 use anyhow::{Result, anyhow};
 use log::*;

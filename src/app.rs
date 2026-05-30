@@ -42,6 +42,7 @@ impl App {
         create_swapchain(&window, &instance, &device, &mut data)?;
         create_swapchain_image_views(&device, &mut data)?;
 
+        create_render_pass(&device, &instance, &mut data)?;
         create_pipeline(&device, &mut data)?;
 
         Ok( Self { entry, instance, data, device })
@@ -54,7 +55,9 @@ impl App {
 
     /// Destroys our Vulkan app.
     pub unsafe fn destroy(&mut self) {
+        self.device.destroy_pipeline( self.data.pipeline, None);
         self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
+        self.device.destroy_render_pass(self.data.render_pass, None);
         self.data.swapchain_image_views
             .iter()
             .for_each(|i| self.device.destroy_image_view(*i, None));
@@ -84,7 +87,9 @@ pub struct AppData {
     swapchain_extent : vk::Extent2D,
     /// views om images in te renderen
     swapchain_image_views : Vec<vk::ImageView>,
+    render_pass: vk::RenderPass,
     pipeline_layout : vk::PipelineLayout,
+    pipeline: vk::Pipeline,
 }
 
 /*
@@ -165,7 +170,7 @@ impl SwapchainSupport {
 unsafe fn create_pipeline(
     device : &Device,
     data : &mut AppData,
-    ) -> Result<()> {
+) -> Result<()> {
     let vert = include_bytes!("../shaders/vert.spv");
     let frag = include_bytes!("../shaders/frag.spv");
 
@@ -225,7 +230,6 @@ unsafe fn create_pipeline(
         .viewports(viewports)
         .scissors(scissors);
 
-
     let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
         // als true, frags buiten de 'far plane' worden geclamped en niet discarded.
         // handig voor shadow maps. Heeft GPU feature nodig
@@ -251,7 +255,6 @@ unsafe fn create_pipeline(
     let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
         .sample_shading_enable(false)
         .rasterization_samples(vk::SampleCountFlags::_1);
-
 
     // colour blending is het samenvoegen van frag kleur met de kleur die er al was
     // dit mixed old en new colour om een final te berekenen
@@ -285,10 +288,37 @@ unsafe fn create_pipeline(
         .blend_constants([0.0, 0.0, 0.0, 0.0])
         .attachments(attachments);
 
-
     let layout_info = vk::PipelineLayoutCreateInfo::builder();
 
     data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
+
+    let stages = &[vert_stage, frag_stage];
+    let graphics_info = vk::GraphicsPipelineCreateInfo::builder()
+        // editable stages 
+        .stages(stages)
+        // structures die fixed stages beschrijven
+        .vertex_input_state(&vertex_input_state)
+        .input_assembly_state(&input_assembly_state)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization_state)
+        .multisample_state(&multisample_state)
+        .color_blend_state(&color_blend_state)
+        // layout
+        .layout(data.pipeline_layout)
+        // ref to render pass and index of subpass where the graphics pipeline is used
+        .render_pass(data.render_pass)
+        .subpass(0)
+        // optional, ge kunt afleiden van een andere pipeline
+        // switching met inheritance is cheaper dan nieuwe createn
+        // we hebben maar 1, dus wordt nie gebruikt
+        .base_pipeline_handle(vk::Pipeline::null())
+        .base_pipeline_index(-1);
+
+    data.pipeline = device.create_graphics_pipelines(
+        vk::PipelineCache::null(),
+        &[graphics_info],
+        None
+    )?.0[0];
 
     // modules zijn gwn simpele wrappper rond bytecode.
     // compilation & linking gebeurt pas eens de pipeline er is, dus dit is safe te deleten
@@ -301,7 +331,7 @@ unsafe fn create_pipeline(
 unsafe fn create_shader_module(
     device : &Device,
     bytecode : &[u8],
-    ) -> Result<vk::ShaderModule> {
+) -> Result<vk::ShaderModule> {
     let bytec = Bytecode::new(bytecode)?;
     let info = vk::ShaderModuleCreateInfo::builder()
         .code(bytec.code())
@@ -309,6 +339,64 @@ unsafe fn create_shader_module(
     Ok(device.create_shader_module(&info, None)?)
 }
 
+unsafe fn create_render_pass(
+    device : &Device,
+    instance : &Instance,
+    data : &mut AppData
+) -> Result<()> {
+    // NOTE pass beschrijft wat doen bij elke pass van rendering?
+    let color_attachement = vk::AttachmentDescription::builder()
+        // matched de swapchain, duh
+        .format(data.swapchain_format)
+        // geen multisampling, dus 1
+        .samples(vk::SampleCountFlags::_1)
+        // LOAD_OP & STORE_OP zijn voor color & depth data
+        // before rendering, clear tot zwart voorda ge nieuwe frame maakt
+        // LOAD: hou contents van attachment bij
+        // CLEAR: clear ze voor een constant bij start
+        // DONT_CARE: contents zijn undefine, don't care
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        // after rendering
+        // STORE: contents bijhouden in memory 
+        // DONT_CARE: contents van framebuffer zijn undefined na rendering
+        .store_op(vk::AttachmentStoreOp::STORE)
+        // stencil ops voor stencil data, tegenover color & depth van vorige 2
+        // we doen niks met stencil buffer for now
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        // gebruik zeker pixel format
+        // init betekend da we niet caren wat de oute layout was
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        // final is welke layout naar transitionen eens render pass finishes
+        // img moet klaar zijn voor presentation volgens de swapchain, dus PRES_SRC_KHR
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+
+    // ge kunt meerdere subpasses maken bvb voor een reeks postprocessing steps
+    // dit kan voor optimizations zorgen.
+    // Elke subpass hangt af van de vorige state
+    let color_attachment_ref = vk::AttachmentReference::builder()
+        // welke attachment index (we hebben er maar 1, dus index 0)
+        // dit is *exact* de (location = 0) out vec4 outColor van fragShader
+        .attachment(0)
+        // vulkan transitioned naar de gewentste layout 
+        // deze dient als color buffer, dus COLOR_ATTACHMENT_OPTIMAL is best gepast
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let color_attachments = &[color_attachment_ref];
+    let subpass = vk::SubpassDescription::builder()
+        //
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(color_attachments);
+
+    let attachments = &[color_attachement];
+    let subpasses = &[subpass];
+    let info = vk::RenderPassCreateInfo::builder()
+        .attachments(attachments)
+        .subpasses(subpasses);
+
+    data.render_pass = device.create_render_pass(&info, None)?;
+
+    Ok(())
+}
 
 
 
