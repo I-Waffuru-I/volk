@@ -47,6 +47,9 @@ impl App {
 
         create_framebuffers(&device, &mut data)?;
 
+        create_command_pool(&instance, &device, &mut data)?;
+        create_command_buffers(&device, &mut data)?;
+
         Ok( Self { entry, instance, data, device })
     }
 
@@ -57,6 +60,7 @@ impl App {
 
     /// Destroys our Vulkan app.
     pub unsafe fn destroy(&mut self) {
+        self.device.destroy_command_pool(self.data.cmd_pool, None);
         self.device.destroy_pipeline( self.data.pipeline, None);
         self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
         self.data.framebuffers
@@ -96,6 +100,10 @@ pub struct AppData {
     pipeline_layout : vk::PipelineLayout,
     pipeline: vk::Pipeline,
     framebuffers : Vec<vk::Framebuffer>,
+    /// pool om cmds in op te slaan
+    cmd_pool : vk::CommandPool,
+    cmd_buffers : Vec<vk::CommandBuffer>,
+
 }
 
 /*
@@ -171,6 +179,90 @@ impl SwapchainSupport {
  * ------
  */
 
+unsafe fn create_command_buffers(
+    device : &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    // alloc & record cmds voor elke swapchain img
+    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+        .command_pool(data.cmd_pool)
+        // PRIMARY: kunt ge submitten for execution, niet callable voor andere buffers
+        // SECONDARY: kan nie direct submitten, maar wel callable voor andere primary buffs
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(data.framebuffers.len() as u32);
+    data.cmd_buffers = device.allocate_command_buffers(&alloc_info)?;
+
+
+    for (i, cmd_buff) in data.cmd_buffers.iter().enumerate() {
+        let inheritance = vk::CommandBufferInheritanceInfo::builder();
+
+        let cmd_begin_info = vk::CommandBufferBeginInfo::builder()
+            // hoe de buffer gebruikt zal worden. Voor ons rn, geen hiervan
+            // ONE_TIME_SUBMIT: re-recorded direct na 1 keer gebruiken 
+            // RENDER_PASS_CONTINUE: dit is een secondary buff die binnen 1 enkele render pass
+                // gebruikt wordt
+            // SIMULTANEOUS_USE: buff kan resubmitted worden terwijl het pending execution is
+            .flags(vk::CommandBufferUsageFlags::empty())
+            .inheritance_info(&inheritance);
+
+        device.begin_command_buffer(*cmd_buff, &cmd_begin_info)?;
+
+        // define waar shader loads & stores gebeuren
+        let render_area = vk::Rect2D::builder()
+            .offset(vk::Offset2D::default())
+            .extent(data.swapchain_extent);
+
+        // color to clear the framebuffer at the start of render pass
+        // omdat we AttachmentLoadOp::CLEAR gebruikt hebben in de render pass
+        let color_clear_value = vk::ClearValue {
+            color : vk::ClearColorValue {
+                float32: [0.1, 0.1, 0.2, 1.0],
+            }
+        };
+
+        let clear_values = &[color_clear_value];
+        let info = vk::RenderPassBeginInfo::builder()
+            .render_area(render_area)
+            .render_pass(data.render_pass)
+            .framebuffer(data.framebuffers[i])
+            .clear_values(clear_values);
+
+        // INLINE: renderpass cmds embedded in de primary buffer, geen secondary executed
+        // SECONDARY_CMD_BUF: renderpass cmds executen van secondary cmd buffs
+        device.cmd_begin_render_pass(*cmd_buff, &info, vk::SubpassContents::INLINE);
+
+        device.cmd_bind_pipeline(*cmd_buff, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
+
+        // 3 vertices total in the triangle 
+        // 1 is default als geen geen instanced rendering doet
+        // offset in de vertex buffer
+        // offset for instanced rendering
+        device.cmd_draw(*cmd_buff, 3, 1, 0, 0);
+        device.cmd_end_render_pass(*cmd_buff);
+        device.end_command_buffer(*cmd_buff)?;
+    }
+
+    Ok(())
+}
+
+unsafe fn create_command_pool(
+    instance : &Instance,
+    device : &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
+    let info = vk::CommandPoolCreateInfo::builder()
+        // we recorden de buffers bij start en that's it, dus geen van deze flags activeren
+        // TRANSIENT: buffers worden veel ge re-recorded met new cmds 
+        // RESET_CMD_BUF: cmd buffs kunnen indiv re-recorded worden. Zonder dit moeten ze alle samen
+        // PROTECTED: protected memory alloc
+        .flags(vk::CommandPoolCreateFlags::empty())
+        // elke pool kan maar 1 soort queue family putten
+        .queue_family_index(indices.graphics);
+
+    data.cmd_pool = device.create_command_pool(&info, None)?;
+    Ok(())
+}
 
 unsafe fn create_framebuffers(
     device : &Device,
