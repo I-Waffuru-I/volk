@@ -10,7 +10,7 @@ use vulkanalia::window as vk_window;
 use vulkanalia::vk::{KhrSurfaceExtensionInstanceCommands, KhrSwapchainExtensionDeviceCommands};
 
 use crate::SuitabilityError;
-use crate::consts::{DEVICE_EXTENSIONS, PORTABILITY_MACOS_VERSION, VALIDATION_ENABLED, VALIDATION_LAYER};
+use crate::consts::{DEVICE_EXTENSIONS, MAX_FRAMES_IN_FLIGHT, PORTABILITY_MACOS_VERSION, VALIDATION_ENABLED, VALIDATION_LAYER};
 
 
 /*
@@ -24,6 +24,8 @@ pub struct App {
     instance: Instance,
     data : AppData,
     device : Device,
+    // voor multiple frames in-flight
+    frame: usize,
 }
 
 impl App {
@@ -49,17 +51,99 @@ impl App {
 
         create_command_pool(&instance, &device, &mut data)?;
         create_command_buffers(&device, &mut data)?;
+        create_sync_objects(&device, &mut data)?;
 
-        Ok( Self { entry, instance, data, device })
+        let frame : usize = 0;
+        Ok( Self { entry, instance, data, device, frame })
     }
 
     /// Renders a frame for our Vulkan app.
     pub unsafe fn render(&mut self, window: &Window) -> Result<()> {
+        // acquire image from swapchain 
+        // execute cmd buff with the image as attachment in the fbuff 
+        // return img to swapchain for presentation
+        // gebeurt allemaal async, wa kut is, dus gebruik fences of semaphores om te coordineren
+
+        // await fence
+        self.device.wait_for_fences(
+            &[self.data.in_flight_fences[self.frame]],
+            true, 
+            u64::MAX
+        )?;
+
+        // 1. acquire image from swapchain
+        let img_index = self
+            .device
+            .acquire_next_image_khr(
+                self.data.swapchain,
+                // disable timeout
+                u64::MAX,
+                self.data.sem_img_available[self.frame],
+                vk::Fence::null()
+            )?.0 as usize;
+        if !self.data.images_in_flight[img_index].is_null() {
+            self.device.wait_for_fences(
+                &[self.data.images_in_flight[img_index]],
+                true,
+                u64::MAX,
+            )?;
+        }
+        self.data.images_in_flight[img_index] = self.data.in_flight_fences[self.frame];
+
+        // 2. execute cmd buffers
+        let wait_semaphores = &[self.data.sem_img_available[self.frame]];
+        let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let cmd_buffers = &[self.data.cmd_buffers[img_index]];
+        let signal_semaphores = &[self.data.sem_render_finished[self.frame]];
+        let submit_info = vk::SubmitInfo::builder()
+            // elke entry in wait_stages heeft een overeenkomstige sema in wait_sema op dezelfe index
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(cmd_buffers)
+            .signal_semaphores(signal_semaphores);
+
+        self.device.reset_fences(
+            &[self.data.in_flight_fences[self.frame]]
+        )?;
+
+        self.device.queue_submit(
+            self.data.graphics_queue,
+            &[submit_info],
+           self.data.in_flight_fences[self.frame],
+        )?;
+
+        // 3. presentation phase, return img to swapchain
+        let swapchains = &[self.data.swapchain];
+        let img_indices = &[img_index as u32];
+        let present_info = vk::PresentInfoKHR::builder()
+            .wait_semaphores(signal_semaphores)
+            .swapchains(swapchains)
+            .image_indices(img_indices);
+
+        self.device.queue_present_khr(self.data.present_queue,&present_info)?;
+        self.frame = (self.frame +1) % MAX_FRAMES_IN_FLIGHT;
+
         Ok(())
     }
 
     /// Destroys our Vulkan app.
     pub unsafe fn destroy(&mut self) {
+
+        // await dat render async steps done zijn 
+        self.device.device_wait_idle().expect("Failed to await device idle state.");
+
+
+        self.data.sem_img_available
+            .iter()
+            .for_each(|s| self.device.destroy_semaphore(*s, None));
+        self.data.sem_render_finished
+            .iter()
+            .for_each(|s| self.device.destroy_semaphore(*s, None));
+
+        self.data.in_flight_fences
+            .iter()
+            .for_each(|f| self.device.destroy_fence(*f, None));
+
         self.device.destroy_command_pool(self.data.cmd_pool, None);
         self.device.destroy_pipeline( self.data.pipeline, None);
         self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
@@ -103,6 +187,16 @@ pub struct AppData {
     /// pool om cmds in op te slaan
     cmd_pool : vk::CommandPool,
     cmd_buffers : Vec<vk::CommandBuffer>,
+
+    // semaphores
+    /// img has been acquired, ready for rendering
+    sem_img_available: Vec<vk::Semaphore>,
+    /// rendering done, presentation can happen
+    sem_render_finished: Vec<vk::Semaphore>,
+    // fences om cpu-gpu te syncen
+    in_flight_fences : Vec<vk::Fence>,
+    // track of een inflight frame elke image al gebruikt, acquire_next_image_khr is out-of-order
+    images_in_flight : Vec<vk::Fence>,
 
 }
 
@@ -179,6 +273,33 @@ impl SwapchainSupport {
  * ------
  */
 
+
+unsafe fn create_sync_objects(
+    device : &Device,
+    data: &mut AppData,
+)->Result<()> {
+
+    let sem_info = vk::SemaphoreCreateInfo::builder();
+    let fen_info = vk::FenceCreateInfo::builder()
+        // start in signaled mode, anders zal render await voor altijd wachten
+        .flags(vk::FenceCreateFlags::SIGNALED);
+
+    for _ in 0..MAX_FRAMES_IN_FLIGHT {
+        data.sem_img_available.push(device.create_semaphore(&sem_info, None)?);
+        data.sem_render_finished.push(device.create_semaphore(&sem_info, None)?);
+
+        data.in_flight_fences.push(device.create_fence(&fen_info, None)?)
+    }
+
+    // init met null want geen image is in gebruik bij start
+    data.images_in_flight = data.swapchain_images
+        .iter()
+        .map(|_| vk::Fence::null())
+        .collect();
+
+    Ok(())
+}
+
 unsafe fn create_command_buffers(
     device : &Device,
     data: &mut AppData,
@@ -190,6 +311,8 @@ unsafe fn create_command_buffers(
         // SECONDARY: kan nie direct submitten, maar wel callable voor andere primary buffs
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(data.framebuffers.len() as u32);
+    debug!("framebuffers: {:?}", data.framebuffers);
+    debug!("alloc cmd buffer: {:?}", alloc_info);
     data.cmd_buffers = device.allocate_command_buffers(&alloc_info)?;
 
 
@@ -268,6 +391,7 @@ unsafe fn create_framebuffers(
     device : &Device,
     data : &mut AppData
 ) -> Result<()> {
+    debug!("swch img_views : {:?}", data.swapchain_image_views);
     data.framebuffers = data
         .swapchain_image_views
         .iter()
@@ -280,6 +404,7 @@ unsafe fn create_framebuffers(
                 .height(data.swapchain_extent.height)
                 .layers(1);
 
+            debug!("creating fb: {:?}", create_info);
             device.create_framebuffer(&create_info, None)
         })
     .collect::<Result<Vec<_>, _>>()?;
@@ -506,11 +631,26 @@ unsafe fn create_render_pass(
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(color_attachments);
 
+    let dependency = vk::SubpassDependency::builder()
+        // index van dependency subpass, specifiek degene voor of na de subpass (volgens of het
+        // src/dst is)
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        // index van dependent subpass, in dit geval de 1 enkele die we hebben
+        .dst_subpass(0)
+        // welke ops op te wachten en waar in de pipeline die gebeuren
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
+        // prevent transition tot het necessary en toegestaan is; wnr we kleur willen schrijven
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
     let attachments = &[color_attachement];
     let subpasses = &[subpass];
+    let dependencies = &[dependency];
     let info = vk::RenderPassCreateInfo::builder()
         .attachments(attachments)
-        .subpasses(subpasses);
+        .subpasses(subpasses)
+        .dependencies(dependencies);
 
     data.render_pass = device.create_render_pass(&info, None)?;
 
@@ -813,7 +953,8 @@ unsafe fn create_swapchain_image_views(
     device : &Device,
     data: &mut AppData,
 ) -> Result<()> {
-     let x = data
+    debug!("swch images: {:?}", data.swapchain_images);
+    data.swapchain_image_views = data
         .swapchain_images
         .iter()
         .map(|i| {

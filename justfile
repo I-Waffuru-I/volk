@@ -6,6 +6,11 @@ default:
 run:
    cargo run
 
+[env("RUST_LOG", "debug")]
+dbg:
+   cargo run
+
+
 [working-directory: 'shaders']
 cmp:
    glslc shader.vert -o vert.spv
