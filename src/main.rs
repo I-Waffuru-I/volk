@@ -10,7 +10,7 @@
 )]
 
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use log::*;
 use winit::dpi::LogicalSize;
 use winit::event::{Event, WindowEvent};
@@ -41,15 +41,32 @@ fn main() -> Result<()> {
 
     // App
     let mut app = unsafe { app::App::create(&window)? };
+    let mut minimized = false;
 
     info!("Starting main loop");
     event_loop.run(move |event, elwt| {
         match event {
             // Request a redraw when all events were processed.
             Event::AboutToWait => window.request_redraw(),
-            Event::WindowEvent { event, .. } => match event {
-                // Render a frame if our Vulkan app is not being destroyed.
-                WindowEvent::RedrawRequested if !elwt.exiting() => unsafe { app.render(&window) }.unwrap(),
+            Event::WindowEvent {event, .. } => match event {
+                WindowEvent::Resized(size) => {
+                    if size.width == 0 || size.height == 0 {
+                        minimized = true;
+                    } else {
+                        minimized = false;
+                        app.resized = true;
+                    }
+                }
+                // Render a frame if our Vulkan app is not being destroyed.or minimized
+                WindowEvent::RedrawRequested if !elwt.exiting() && !minimized => {
+                    if let Err(e) = unsafe { app.render(&window) } {
+                        error!("Render error, rebuilding App: {e}");
+                        unsafe {
+                            app.destroy();
+                            app = app::App::create(&window).expect("Failed to recreate App after device loss");
+                        }
+                    }
+                }
                 // Destroy our Vulkan app.
                 WindowEvent::CloseRequested => {
                     elwt.exit();

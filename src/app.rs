@@ -26,6 +26,8 @@ pub struct App {
     device : Device,
     // voor multiple frames in-flight
     frame: usize,
+    // Meeste drivers handlen window resize vanzelf, maar beter toch zelf ook bijhouden just in case
+    pub resized : bool,
 }
 
 impl App {
@@ -54,8 +56,28 @@ impl App {
         create_sync_objects(&device, &mut data)?;
 
         let frame : usize = 0;
-        Ok( Self { entry, instance, data, device, frame })
+        let resized = false;
+        Ok( Self { entry, instance, data, device, frame, resized })
     }
+
+    /// catch cases where screen resizes and swapchain is now incompatible
+    unsafe fn recreate_swapchain(&mut self, window: &Window) -> Result<()> {
+        self.device.device_wait_idle()?;
+        self.destroy_swapchain()?;
+
+        create_swapchain(&window, &self.instance, &self.device, &mut self.data)?;
+        create_swapchain_image_views(&self.device, &mut self.data)?;
+
+        create_render_pass(&self.device, &self.instance, &mut self.data)?;
+        create_pipeline(&self.device, &mut self.data)?;
+
+        create_framebuffers(&self.device, &mut self.data)?;
+        self.data.images_in_flight
+            .resize(self.data.swapchain_images.len(), vk::Fence::null());
+
+        Ok(())
+    }
+
 
     /// Renders a frame for our Vulkan app.
     pub unsafe fn render(&mut self, window: &Window) -> Result<()> {
@@ -72,7 +94,7 @@ impl App {
         )?;
 
         // 1. acquire image from swapchain
-        let img_index = self
+        let result = self
             .device
             .acquire_next_image_khr(
                 self.data.swapchain,
@@ -80,7 +102,14 @@ impl App {
                 u64::MAX,
                 self.data.sem_img_available[self.frame],
                 vk::Fence::null()
-            )?.0 as usize;
+            );
+        let img_index = match result {
+            Ok((i,_)) => i as usize,
+            // swapchain is out of date, ignore current render pass and recreate swapchain for the
+            // next one because you cannot present to it anyway
+            Err(vk::ErrorCode::OUT_OF_DATE_KHR) => return self.recreate_swapchain(window),
+            Err(e) => return Err(anyhow!(e))
+        };
         if !self.data.images_in_flight[img_index].is_null() {
             self.device.wait_for_fences(
                 &[self.data.images_in_flight[img_index]],
@@ -98,6 +127,7 @@ impl App {
         let submit_info = vk::SubmitInfo::builder()
             // elke entry in wait_stages heeft een overeenkomstige sema in wait_sema op dezelfe index
             .wait_semaphores(wait_semaphores)
+            // in welke stage te wachten
             .wait_dst_stage_mask(wait_stages)
             .command_buffers(cmd_buffers)
             .signal_semaphores(signal_semaphores);
@@ -120,7 +150,18 @@ impl App {
             .swapchains(swapchains)
             .image_indices(img_indices);
 
-        self.device.queue_present_khr(self.data.present_queue,&present_info)?;
+        let result = self.device.queue_present_khr(self.data.present_queue, &present_info);
+
+        let changed = result == Ok(vk::SuccessCode::SUBOPTIMAL_KHR)
+            || result == Err(vk::ErrorCode::OUT_OF_DATE_KHR);
+
+        if self.resized || changed {
+            self.resized = false;
+            self.recreate_swapchain(window)?;
+        } else if let Err(e) = result {
+            return Err(anyhow!(e));
+        }
+
         self.frame = (self.frame +1) % MAX_FRAMES_IN_FLIGHT;
 
         Ok(())
@@ -131,21 +172,32 @@ impl App {
 
         // await dat render async steps done zijn 
         self.device.device_wait_idle().expect("Failed to await device idle state.");
-
-
-        self.data.sem_img_available
-            .iter()
-            .for_each(|s| self.device.destroy_semaphore(*s, None));
-        self.data.sem_render_finished
-            .iter()
-            .for_each(|s| self.device.destroy_semaphore(*s, None));
+        self.destroy_swapchain().expect("Failed to destroy swapchain");
 
         self.data.in_flight_fences
             .iter()
             .for_each(|f| self.device.destroy_fence(*f, None));
+        self.data.sem_render_finished
+            .iter()
+            .for_each(|s| self.device.destroy_semaphore(*s, None));
+        self.data.sem_img_available
+            .iter()
+            .for_each(|s| self.device.destroy_semaphore(*s, None));
 
         self.device.destroy_command_pool(self.data.cmd_pool, None);
+        self.device.destroy_device(None);
+
+        // window handle
+        self.instance.destroy_surface_khr(self.data.surface, None);
+        // 9/10 moet dit als laatsts gedestroyed worden
+        self.instance.destroy_instance(None);
+
+    }
+
+    unsafe fn destroy_swapchain(&mut self) -> Result<()> {
         self.device.destroy_pipeline( self.data.pipeline, None);
+        // replace cmd pools ipv deleten en opnieuw maken
+        self.device.free_command_buffers(self.data.cmd_pool, &self.data.cmd_buffers);
         self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
         self.data.framebuffers
             .iter()
@@ -155,11 +207,8 @@ impl App {
             .iter()
             .for_each(|i| self.device.destroy_image_view(*i, None));
         self.device.destroy_swapchain_khr(self.data.swapchain, None);
-        self.device.destroy_device(None);
-        // window handle
-        self.instance.destroy_surface_khr(self.data.surface, None);
-        // 9/10 moet dit als laatsts gedestroyed worden
-        self.instance.destroy_instance(None);
+
+        Ok(())
     }
 }
 
@@ -197,6 +246,7 @@ pub struct AppData {
     in_flight_fences : Vec<vk::Fence>,
     // track of een inflight frame elke image al gebruikt, acquire_next_image_khr is out-of-order
     images_in_flight : Vec<vk::Fence>,
+
 
 }
 
@@ -274,6 +324,7 @@ impl SwapchainSupport {
  */
 
 
+/// Creates semaphores and fences needed to synchronize everything
 unsafe fn create_sync_objects(
     device : &Device,
     data: &mut AppData,
